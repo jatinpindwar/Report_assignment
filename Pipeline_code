@@ -1,0 +1,112 @@
+from confluent_kafka import Producer,Consumer, KafkaError
+import happybase
+from pyspark.sql import SparkSession
+from elasticsearch import Elasticsearch
+
+# Kafka broker(s) configuration
+kafka_brokers = 'localhost:9092'  # Replace with your Kafka broker(s) info
+
+# Kafka topic where clickstream data will be sent
+topic = 'stream_topic'  # Replace with your desired topic name
+
+def report_status(error, msg):
+    if error is not None:
+        print(f"Message delivery failed: {error}")
+    else:
+        print(f"Message delivered to topic: {msg.topic()} - Partition: {msg.partition()} - Offset: {msg.offset()}")
+
+# Create Kafka producer configuration
+producer_config = {
+    'bootstrap.servers': kafka_brokers,
+    'client.id': 'clickstream_id',  # Replace with a unique client ID
+}
+
+# Create Kafka producer instance
+producer = Producer(producer_config)
+
+# Sample clickstream data 
+random_data = [
+    "click1,user1,timestamp1,url1,country1,city1,browser1,os1,device1",
+    "click2,user2,timestamp2,url2,country2,city2,browser2,os2,device2",
+    "click3,user3,timestamp3,url1,country1,city3,browser1,os3,device1",]
+
+# Send clickstream data to Kafka topic
+for data in random_data:
+    producer.produce(topic, value=data, callback=report_status)
+
+# Wait for any outstanding messages to be delivered
+producer.flush()
+
+# Close the Kafka producer
+producer.close()
+
+----------------------------------------------------------------------------------------------------------------
+
+
+# Step 1: Ingest Clickstream Data from Kafka
+kafka_config = {
+    'bootstrap.servers': kafka_brokers,  
+    'group.id': 'clickstream_group_id',
+    'auto.offset.reset': 'earliest'
+}
+
+consumer = Consumer(kafka_config)
+consumer.subscribe([topic])
+
+# Step 2: Store the ingested data in Apache HBase
+hbase_host = 'localhost'  
+hbase_table = 'geo_table' 
+
+connection = happybase.Connection(hbase_host)
+table = connection.table(hbase_table)
+
+for msg in consumer:
+    if not msg.error():
+        click_data = msg.value().split(',')  # Assuming the clickstream data is comma-separated
+        row_key = click_data[0]  # Assuming the unique identifier is the first value
+
+        # Assuming click_data contains user ID, timestamp, and URL in order
+        click_info = {
+            'click_data:user_id': click_data[1],
+            'click_data:timestamp': click_data[2],
+            'click_data:url': click_data[3],
+            'geo_data:country': click_data[4],  # Assuming country is the 5th value
+            'geo_data:city': click_data[5],  # Assuming city is the 6th value
+            'user_agent_data:browser': click_data[6],  # Assuming browser is the 7th value
+            'user_agent_data:os': click_data[7],  # Assuming OS is the 8th value
+            'user_agent_data:device': click_data[8]  # Assuming device is the 9th value
+        }
+
+        table.put(row_key, click_info)
+
+# Step 3: Periodically process the stored clickstream data with Apache Spark
+spark = SparkSession.builder.appName("ClickstreamProcessing").getOrCreate()
+
+# HBase data is preprocessed into a DataFrame with columns 'url', 'country', 'time_spent', and 'user_id'
+# Use Spark SQL to aggregate data by 'url' and 'country' and calculate number of clicks, unique users, and average time spent
+
+processed_data = spark.sql("""
+    SELECT url, country,
+           COUNT(*) as num_clicks,
+           COUNT(DISTINCT user_id) as num_unique_users,
+           AVG(time_spent) as avg_time_spent
+    FROM clickstream_data
+    GROUP BY url, country
+""")
+
+# Step 4: Index the processed data in Elasticsearch
+es_host = 'localhost'
+es_index = 'clickstream_data_index' 
+
+es = Elasticsearch([{'host': es_host, 'port': 9200}])
+processed_data.write.format("org.elasticsearch.spark.sql").option("es.resource", es_index).save()
+
+# Stop the Spark session
+spark.stop()
+
+# Close the Kafka consumer
+consumer.close()
+
+
+
+
